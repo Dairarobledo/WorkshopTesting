@@ -1,0 +1,115 @@
+name: Create issues from README_TICKETS and README_LABS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  create_issues:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure labels exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          # gh label create puede actualizar si existe con --force (útil)
+          gh label create ticket --description "Bug ticket / incidencia" --color "d73a4a" --force
+          gh label create lab --description "Practice lab / ejercicio de práctica" --color "0075ca" --force
+
+      - name: Parse READMEs and create issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          import os, re, json, subprocess, textwrap
+          from pathlib import Path
+
+          REPO = os.environ["REPO"]
+
+          def run(cmd, input_text=None):
+            res = subprocess.run(cmd, input=input_text, text=True, capture_output=True)
+            if res.returncode != 0:
+              raise RuntimeError(f"Command failed: {cmd}\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
+            return res.stdout.strip()
+
+          def issue_exists(title: str) -> bool:
+            # Busca por título exacto aproximado (in:title) en el repo
+            q = f'repo:{REPO} type:issue in:title "{title}"'
+            out = run(["gh","api","-H","Accept: application/vnd.github+json", f"/search/issues?q={q}"])
+            data = json.loads(out)
+            return data.get("total_count", 0) > 0
+
+          def create_issue(title: str, body: str, labels):
+            if issue_exists(title):
+              print(f"SKIP (exists): {title}")
+              return
+            payload = {"title": title, "body": body, "labels": labels}
+            run(["gh","api","-H","Accept: application/vnd.github+json",
+                 f"/repos/{REPO}/issues", "-f", f"title={title}", "-f", f"body={body}", "-f", f"labels[]={labels[0]}" ] +
+                 sum([["-f", f"labels[]={lab}"] for lab in labels[1:]], [])
+            )
+            print(f"CREATED: {title}")
+
+          def parse_sections(md: str, heading_regex: str):
+            """
+            heading_regex: regex con grupo (title) que captura el título del heading.
+            Devuelve [(title, body), ...]
+            """
+            lines = md.splitlines()
+            matches = []
+            for i, line in enumerate(lines):
+              m = re.match(heading_regex, line.strip())
+              if m:
+                matches.append((i, m.group("title").strip()))
+            items = []
+            for idx, (start_i, title) in enumerate(matches):
+              end_i = matches[idx+1][0] if idx+1 < len(matches) else len(lines)
+              body = "\n".join(lines[start_i+1:end_i]).strip()
+              # Si el body está vacío, aún creamos issue (pero no debería)
+              items.append((title, body))
+            return items
+
+          def load_file(path: str):
+            p = Path(path)
+            if not p.exists():
+              print(f"WARNING: {path} not found, skipping.")
+              return ""
+            return p.read_text(encoding="utf-8")
+
+          tickets_md = load_file("README_TICKETS.md")
+          labs_md    = load_file("README_LABS.md")
+
+          # Tickets: headings tipo "## 🎫 DIV-001 — ..."
+          ticket_items = parse_sections(
+            tickets_md,
+            r"^##\s+(?P<title>.+)$"
+          )
+
+          # Labs: headings tipo "## LAB-JU-01 — ..." o "## LAB-..."
+          lab_items = parse_sections(
+            labs_md,
+            r"^(##)\s+(?P<title>LAB-[A-Z]{2}-\d+\s+—\s+.+)$"
+          )
+
+          # Crea issues
+          for title, body in ticket_items:
+            # Filtra solo tickets (por si el README tiene otras secciones con ##)
+            if not re.search(r"\b[A-Z]{3}-\d{3}\b", title):
+              continue
+            create_issue(title=title, body=body, labels=["ticket"])
+
+          for title, body in lab_items:
+            create_issue(title=title, body=body, labels=["lab"])
+
+          print("Done.")
+          PY
