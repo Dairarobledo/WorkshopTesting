@@ -1,4 +1,4 @@
-name: Create issues from README_TICKETS and README_LABS
+name: Create issues from files (tickets + labs)
 
 on:
   workflow_dispatch:
@@ -8,22 +8,22 @@ permissions:
   contents: read
 
 jobs:
-  create_issues:
+  create:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Ensure labels exist
+      - name: Ensure base labels exist
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          # gh label create puede actualizar si existe con --force (útil)
           gh label create ticket --description "Bug ticket / incidencia" --color "d73a4a" --force
-          gh label create lab --description "Practice lab / ejercicio de práctica" --color "0075ca" --force
+          gh label create lab --description "Practice lab / ejercicio" --color "0075ca" --force
+          gh label create junit --description "JUnit related" --color "1d76db" --force
+          gh label create mockito --description "Mockito related" --color "0e8a16" --force
 
-      - name: Parse READMEs and create issues
+      - name: Create issues from markdown files
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -31,85 +31,89 @@ jobs:
           set -e
 
           python3 - <<'PY'
-          import os, re, json, subprocess, textwrap
+          import os, re, json, subprocess
           from pathlib import Path
 
           REPO = os.environ["REPO"]
+          BASE = Path(".github/issue-templates-data")
 
-          def run(cmd, input_text=None):
-            res = subprocess.run(cmd, input=input_text, text=True, capture_output=True)
-            if res.returncode != 0:
-              raise RuntimeError(f"Command failed: {cmd}\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
-            return res.stdout.strip()
+          def run(cmd):
+            r = subprocess.run(cmd, text=True, capture_output=True)
+            if r.returncode != 0:
+              raise RuntimeError(f"Command failed: {cmd}\n{r.stderr}")
+            return r.stdout.strip()
 
           def issue_exists(title: str) -> bool:
-            # Busca por título exacto aproximado (in:title) en el repo
             q = f'repo:{REPO} type:issue in:title "{title}"'
             out = run(["gh","api","-H","Accept: application/vnd.github+json", f"/search/issues?q={q}"])
             data = json.loads(out)
             return data.get("total_count", 0) > 0
 
-          def create_issue(title: str, body: str, labels):
+          def parse_frontmatter(md: str):
+            # Espera:
+            # ---
+            # title: "..."
+            # labels: ["a","b"]
+            # ---
+            if not md.startswith("---"):
+              raise ValueError("Missing frontmatter (--- ... ---)")
+
+            m = re.search(r"^---\s*\n(.*?)\n---\s*\n(.*)$", md, flags=re.S)
+            if not m:
+              raise ValueError("Invalid frontmatter block")
+
+            fm, body = m.group(1), m.group(2)
+            title_m = re.search(r'^\s*title:\s*"(.*)"\s*$', fm, flags=re.M)
+            labels_m = re.search(r'^\s*labels:\s*\[(.*)\]\s*$', fm, flags=re.M)
+
+            if not title_m:
+              raise ValueError("Frontmatter missing title")
+            title = title_m.group(1).strip()
+
+            labels = []
+            if labels_m:
+              raw = labels_m.group(1).strip()
+              if raw:
+                labels = [x.strip().strip('"').strip("'") for x in raw.split(",") if x.strip()]
+
+            return title, labels, body.strip()
+
+          def create_issue(title: str, labels, body: str):
             if issue_exists(title):
               print(f"SKIP (exists): {title}")
               return
-            payload = {"title": title, "body": body, "labels": labels}
-            run(["gh","api","-H","Accept: application/vnd.github+json",
-                 f"/repos/{REPO}/issues", "-f", f"title={title}", "-f", f"body={body}", "-f", f"labels[]={labels[0]}" ] +
-                 sum([["-f", f"labels[]={lab}"] for lab in labels[1:]], [])
-            )
+
+            args = ["gh","api","-H","Accept: application/vnd.github+json",
+                    f"/repos/{REPO}/issues",
+                    "-f", f"title={title}",
+                    "-f", f"body={body}"]
+            for lab in labels:
+              args += ["-f", f"labels[]={lab}"]
+
+            run(args)
             print(f"CREATED: {title}")
 
-          def parse_sections(md: str, heading_regex: str):
-            """
-            heading_regex: regex con grupo (title) que captura el título del heading.
-            Devuelve [(title, body), ...]
-            """
-            lines = md.splitlines()
-            matches = []
-            for i, line in enumerate(lines):
-              m = re.match(heading_regex, line.strip())
-              if m:
-                matches.append((i, m.group("title").strip()))
-            items = []
-            for idx, (start_i, title) in enumerate(matches):
-              end_i = matches[idx+1][0] if idx+1 < len(matches) else len(lines)
-              body = "\n".join(lines[start_i+1:end_i]).strip()
-              # Si el body está vacío, aún creamos issue (pero no debería)
-              items.append((title, body))
-            return items
+          if not BASE.exists():
+            print(f"WARNING: {BASE} does not exist. Nothing to do.")
+            raise SystemExit(0)
 
-          def load_file(path: str):
-            p = Path(path)
-            if not p.exists():
-              print(f"WARNING: {path} not found, skipping.")
-              return ""
-            return p.read_text(encoding="utf-8")
+          files = sorted(BASE.rglob("*.md"))
+          if not files:
+            print("No issue files found.")
+            raise SystemExit(0)
 
-          tickets_md = load_file("README_TICKETS.md")
-          labs_md    = load_file("README_LABS.md")
+          for f in files:
+            md = f.read_text(encoding="utf-8")
+            title, labels, body = parse_frontmatter(md)
 
-          # Tickets: headings tipo "## 🎫 DIV-001 — ..."
-          ticket_items = parse_sections(
-            tickets_md,
-            r"^##\s+(?P<title>.+)$"
-          )
+            # Si alguien no pone labels, inferimos por carpeta
+            if not labels:
+              if "tickets" in f.parts:
+                labels = ["ticket"]
+              elif "labs" in f.parts:
+                labels = ["lab"]
 
-          # Labs: headings tipo "## LAB-JU-01 — ..." o "## LAB-..."
-          lab_items = parse_sections(
-            labs_md,
-            r"^(##)\s+(?P<title>LAB-[A-Z]{2}-\d+\s+—\s+.+)$"
-          )
-
-          # Crea issues
-          for title, body in ticket_items:
-            # Filtra solo tickets (por si el README tiene otras secciones con ##)
-            if not re.search(r"\b[A-Z]{3}-\d{3}\b", title):
-              continue
-            create_issue(title=title, body=body, labels=["ticket"])
-
-          for title, body in lab_items:
-            create_issue(title=title, body=body, labels=["lab"])
+            create_issue(title, labels, body)
 
           print("Done.")
           PY
