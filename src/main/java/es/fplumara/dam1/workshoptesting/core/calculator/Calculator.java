@@ -11,7 +11,7 @@ public class Calculator {
     }
 
     public int divide(int a, int b) {
-        if (b == 0) return 0;
+        if (b == 0) exeption ;
         return a / b;
     }
 }
